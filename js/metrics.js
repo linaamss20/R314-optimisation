@@ -1,166 +1,179 @@
-/* metrics.js — widget d'évaluation des performances (client-side)
-   Affiche FCP, LCP, CLS, TBT (~approx), #requêtes et poids total.
-   N'emploie aucune dépendance externe. */
-(function(){
-  const state = {
-    fcp: null,
-    lcp: null,
-    cls: 0,
-    clsEntries: [],
-    longTasks: 0,
-    longTasksTime: 0,
-    totalBlockingTime: 0, // approx: somme (longTask - 50ms)
-    resources: [],
-    totalRequests: 0,
-    totalBytes: 0,
-    nav: null
+/* metrics.js — Widget d'évaluation des performances (Optimized)
+   Shadow DOM, RAF Debouncing, Modern Syntax. */
+(function() {
+  // Configuration
+  const CONF = {
+    refreshRate: 500, // Ms min entre 2 scans de ressources lourds
+    styles: `
+      :host { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+      #perf-panel {
+        position: fixed; right: 16px; bottom: 16px; z-index: 10000;
+        width: 300px; max-width: 90vw;
+        background: rgba(10, 12, 28, 0.95); color: #E8ECF1;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+        backdrop-filter: blur(8px); padding: 14px;
+        font-size: 13px; line-height: 1.4;
+      }
+      .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+      .title { font-weight: 700; letter-spacing: 0.5px; color: #fff; }
+      .btn-group { display: flex; gap: 6px; }
+      button { cursor: pointer; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; padding: 4px 8px; transition: opacity 0.2s; }
+      button:hover { opacity: 0.8; }
+      #btn-meas { background: #7C5CFF; color: white; }
+      #btn-close { background: rgba(255,255,255,0.1); color: #ccc; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+      .metric { display: flex; justify-content: space-between; }
+      .label { opacity: 0.7; }
+      .val { font-weight: 600; font-feature-settings: "tnum"; }
+      .note { margin-top: 10px; font-size: 11px; opacity: 0.5; font-style: italic; text-align: center; }
+    `
   };
 
-  // Helper: formatters
-  const fmtMs = v => (v==null?'-':v.toFixed(0)+' ms');
-  const fmtKB = v => (v==null?'-':(v/1024).toFixed(1)+' KB');
+  const state = {
+    fcp: null, lcp: null, cls: 0,
+    longTasks: 0, tbt: 0,
+    reqCount: 0, reqBytes: 0,
+    rafId: null
+  };
 
-  // Observe FCP (first-contentful-paint)
-  try{
-    const poPaint = new PerformanceObserver((list)=>{
-      for(const e of list.getEntries()){
-        if(e.name === 'first-contentful-paint' && state.fcp == null){
-          state.fcp = e.startTime;
-          update();
-          poPaint.disconnect();
-        }
-      }
-    });
-    poPaint.observe({ type:'paint', buffered:true });
-  }catch(err){}
+  // Formatters
+  const fmt = (n, u) => n == null ? '-' : `${n.toFixed(n < 1 ? 3 : 0)}${u}`;
+  const fmtKB = n => n == null ? '-' : `${(n / 1024).toFixed(1)} KB`;
 
-  // Observe LCP (largest-contentful-paint)
-  try{
-    const poLcp = new PerformanceObserver((list)=>{
-      for(const e of list.getEntries()){
-        state.lcp = e.renderTime || e.loadTime || e.startTime;
-      }
-      update();
-    });
-    poLcp.observe({ type:'largest-contentful-paint', buffered:true });
-    addEventListener('visibilitychange', ()=>{
-      if(document.visibilityState === 'hidden') poLcp.takeRecords();
-    });
-  }catch(err){}
+  // --- Observers ---
+  const observers = [];
+  const safeObserve = (type, cb, opts) => {
+    try {
+      const po = new PerformanceObserver(list => cb(list));
+      po.observe({ type, ...opts });
+      observers.push(po);
+      return po;
+    } catch (e) { /* Pas supporté */ }
+  };
 
-  // Observe CLS (cumulative layout shift)
-  try{
-    const poCls = new PerformanceObserver((list)=>{
-      for(const e of list.getEntries()){
-        if(!e.hadRecentInput){
-          state.cls += e.value;
-          state.clsEntries.push(e);
-        }
-      }
-      update();
-    });
-    poCls.observe({ type:'layout-shift', buffered:true });
-  }catch(err){}
-
-  // Observe Long Tasks => approx TBT = somme(max(0, duration-50ms))
-  try{
-    const poLT = new PerformanceObserver((list)=>{
-      for(const e of list.getEntries()){
-        state.longTasks++;
-        state.longTasksTime += e.duration;
-        state.totalBlockingTime += Math.max(0, e.duration - 50);
-      }
-      update();
-    });
-    poLT.observe({ entryTypes:['longtask'] });
-  }catch(err){}
-
-  function collectResources(){
-    const entries = performance.getEntriesByType('resource');
-    state.resources = entries;
-    state.totalRequests = entries.length + 1; // +1 pour le document HTML
-
-    // Try transferSize/encodedBodySize; fallback à encoded if transfer is 0; sinon unknown
-    let total = 0;
-    for(const r of entries){
-      const bytes = (r.transferSize && r.transferSize>0) ? r.transferSize : (r.encodedBodySize||0);
-      total += bytes;
+  // 1. Paint (FCP)
+  safeObserve('paint', (list) => {
+    const entry = list.getEntriesByName('first-contentful-paint')[0];
+    if (entry && !state.fcp) {
+      state.fcp = entry.startTime;
+      scheduleUpdate();
     }
-    state.totalBytes = total;
-  }
+  }, { buffered: true });
 
-  function collectNavigation(){
-    const nav = performance.getEntriesByType('navigation')[0];
-    if(nav) state.nav = nav;
-  }
+  // 2. LCP
+  const poLcp = safeObserve('largest-contentful-paint', (list) => {
+    const entry = list.getEntries().pop();
+    if (entry) {
+      state.lcp = entry.renderTime || entry.loadTime;
+      scheduleUpdate();
+    }
+  }, { buffered: true });
 
-  // UI panel
-  const panel = document.createElement('div');
-  panel.setAttribute('id', 'perf-panel');
-  Object.assign(panel.style, {
-    position:'fixed', right:'16px', bottom:'16px', zIndex:9999,
-    width:'320px', maxWidth:'90vw', fontFamily:'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial',
-    background:'rgba(10,12,28,.9)', color:'#E8ECF1', border:'1px solid rgba(255,255,255,.12)',
-    borderRadius:'12px', boxShadow:'0 10px 40px rgba(0,0,0,.5)',
-    backdropFilter:'blur(6px) saturate(120%)', padding:'12px 14px'
+  // Stop LCP on interaction
+  ['click', 'keydown', 'scroll'].forEach(evt => {
+    addEventListener(evt, () => poLcp?.disconnect(), { once: true, passive: true });
   });
-  panel.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px">
-      <strong style="letter-spacing:.2px">Évaluation perfs</strong>
-      <div>
-        <button id="perf-refresh" style="background:#7C5CFF;color:white;border:0;border-radius:8px;padding:6px 10px;cursor:pointer">Mesurer</button>
-        <button id="perf-close" style="background:transparent;color:#c9d1d9;border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:6px 8px;margin-left:6px;cursor:pointer">×</button>
-      </div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px">
-      <div><div style="opacity:.8">FCP</div><div id="m-fcp" style="font-weight:600">-</div></div>
-      <div><div style="opacity:.8">LCP</div><div id="m-lcp" style="font-weight:600">-</div></div>
-      <div><div style="opacity:.8">CLS</div><div id="m-cls" style="font-weight:600">-</div></div>
-      <div><div style="opacity:.8">TBT (≈)</div><div id="m-tbt" style="font-weight:600">-</div></div>
-      <div><div style="opacity:.8">Requêtes</div><div id="m-req" style="font-weight:600">-</div></div>
-      <div><div style="opacity:.8">Poids total</div><div id="m-bytes" style="font-weight:600">-</div></div>
-    </div>
-    <div style="margin-top:8px;font-size:12px;opacity:.8">
-      <div id="m-note">Cliquez sur <em>Mesurer</em> après vos modifications.</div>
-    </div>
-  `;
-  document.addEventListener('DOMContentLoaded', ()=>{ document.body.appendChild(panel); });
 
-  function update(){
-    collectResources();
-    collectNavigation();
+  // 3. CLS
+  safeObserve('layout-shift', (list) => {
+    for (const e of list.getEntries()) {
+      if (!e.hadRecentInput) state.cls += e.value;
+    }
+    scheduleUpdate();
+  }, { buffered: true });
 
-    const $ = id => panel.querySelector(id);
-    $('#m-fcp').textContent = fmtMs(state.fcp);
-    $('#m-lcp').textContent = fmtMs(state.lcp);
-    $('#m-cls').textContent = state.cls ? state.cls.toFixed(3) : '-';
-    $('#m-tbt').textContent = state.totalBlockingTime ? fmtMs(state.totalBlockingTime) : '-';
-    $('#m-req').textContent = String(state.totalRequests||'-');
-    $('#m-bytes').textContent = state.totalBytes ? fmtKB(state.totalBytes) : '-';
+  // 4. Long Tasks (TBT Approx)
+  safeObserve('longtask', (list) => {
+    for (const e of list.getEntries()) {
+      state.longTasks++;
+      state.tbt += Math.max(0, e.duration - 50);
+    }
+    scheduleUpdate();
+  });
 
-    // Expose pour comparaison avant/après
-    window.__metrics = {
-      fcp: state.fcp, lcp: state.lcp, cls: state.cls,
-      tbtApprox: state.totalBlockingTime,
-      totalRequests: state.totalRequests,
-      totalBytes: state.totalBytes,
-      navigation: state.nav
+  // --- Logic ---
+  function scanResources() {
+    const entries = performance.getEntriesByType('resource');
+    state.reqCount = entries.length + 1; // + document
+    state.reqBytes = entries.reduce((acc, r) => 
+      acc + (r.transferSize > 0 ? r.transferSize : (r.encodedBodySize || 0)), 0);
+  }
+
+  // UI Render Loop (Debounced)
+  function scheduleUpdate(fullScan = false) {
+    if (fullScan) scanResources();
+    if (state.rafId) return;
+    
+    state.rafId = requestAnimationFrame(() => {
+      render();
+      state.rafId = null;
+    });
+  }
+
+  // UI Construction (Shadow DOM)
+  const host = document.createElement('div');
+  const shadow = host.attachShadow({ mode: 'closed' }); 
+  // Note: 'closed' empêche l'accès facile via JS externe, 'open' est ok aussi.
+  
+  function initUI() {
+    host.id = 'web-vitals-widget';
+    shadow.innerHTML = `<style>${CONF.styles}</style>
+      <div id="perf-panel">
+        <div class="header">
+          <span class="title">Perf. Metrics</span>
+          <div class="btn-group">
+            <button id="btn-meas">Scan</button>
+            <button id="btn-close">×</button>
+          </div>
+        </div>
+        <div class="grid">
+          <div class="metric"><span class="label">FCP</span><span class="val" id="v-fcp">-</span></div>
+          <div class="metric"><span class="label">LCP</span><span class="val" id="v-lcp">-</span></div>
+          <div class="metric"><span class="label">CLS</span><span class="val" id="v-cls">-</span></div>
+          <div class="metric"><span class="label">TBT</span><span class="val" id="v-tbt">-</span></div>
+          <div class="metric"><span class="label">Reqs</span><span class="val" id="v-req">-</span></div>
+          <div class="metric"><span class="label">Weight</span><span class="val" id="v-wgt">-</span></div>
+        </div>
+        <div class="note">Valeurs approximatives (Client-side)</div>
+      </div>`;
+    
+    document.body.appendChild(host);
+
+    // Bind Events inside Shadow DOM
+    shadow.getElementById('btn-meas').onclick = () => scheduleUpdate(true);
+    shadow.getElementById('btn-close').onclick = () => {
+        host.remove();
+        observers.forEach(po => po.disconnect());
     };
   }
 
-  // Actions
-  document.addEventListener('click', (e)=>{
-    if(e.target && e.target.id==='perf-refresh'){
-      // Forcer une collecte complète (post-load)
-      update();
-    }
-    if(e.target && e.target.id==='perf-close'){
-      panel.remove();
-    }
-  });
+  function render() {
+    // Helper pour cibler dans le shadow
+    const $ = id => shadow.getElementById(id);
+    if (!$('v-fcp')) return; // UI pas encore prête
 
-  // Mise à jour initiale après load pour disposer des ressources
-  addEventListener('load', ()=>{
-    setTimeout(update, 0);
-  });
+    $('v-fcp').textContent = fmt(state.fcp, ' ms');
+    $('v-lcp').textContent = fmt(state.lcp, ' ms');
+    $('v-cls').textContent = state.cls.toFixed(3);
+    $('v-tbt').textContent = fmt(state.tbt, ' ms');
+    $('v-req').textContent = state.reqCount || '-';
+    $('v-wgt').textContent = fmtKB(state.reqBytes);
+
+    // Expose API
+    window.__metrics = { ...state };
+  }
+
+  // Init
+  if (document.readyState === 'loading') {
+    addEventListener('DOMContentLoaded', () => {
+        initUI();
+        setTimeout(() => scheduleUpdate(true), 500); // Délai pour laisser charger
+    });
+  } else {
+    initUI();
+    scanResources();
+    render();
+  }
+
 })();
