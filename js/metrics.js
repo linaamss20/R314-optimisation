@@ -104,5 +104,19 @@
   function updateUI() {
     collectResources();
     panel.querySelector('#fcp').textContent = fmtMs(state.fcp);
-    panel.querySelector('#lcp').
+    panel.querySelector('#lcp').textContent = fmtMs(state.lcp);
+    panel.querySelector('#cls').textContent = state.cls.toFixed(3);
+    panel.querySelector('#tbt').textContent = fmtMs(state.totalBlockingTime);
+    panel.querySelector('#req').textContent = state.totalRequests;
+    panel.querySelector('#bytes').textContent = fmtKB(state.totalBytes);
+
+    window.__metrics = { ...state };
+  }
+
+  panel.addEventListener('click', e => {
+    if (e.target.id === 'refresh') updateUI();
+  });
+
+  addEventListener('load', () => setTimeout(updateUI, 0));
+})();
 
